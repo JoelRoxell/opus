@@ -3,6 +3,7 @@ package actions
 import (
 	"archive/tar"
 	"builder/repositories"
+	"builder/utils"
 	"bytes"
 	"context"
 	"errors"
@@ -15,6 +16,8 @@ import (
 	"strings"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 )
 
@@ -25,7 +28,7 @@ type Builder struct {
 }
 
 // CreateImage creates a new build and tries to build a container for the specified project.
-func CreateImage(tag string) error {
+func CreateImage(tag string, sourcePath string) error {
 	cli, err := client.NewClientWithOpts(client.WithVersion("1.37"))
 
 	if err != nil {
@@ -34,7 +37,7 @@ func CreateImage(tag string) error {
 
 	files := make(map[string]string)
 
-	err = filepath.Walk("./tmp",
+	err = filepath.Walk(sourcePath,
 		func(path string, info os.FileInfo, err error) error {
 			if err != nil {
 				return err
@@ -46,9 +49,12 @@ func CreateImage(tag string) error {
 				if file.IsDir() {
 					log.Println(path + " is a dir, skipping.")
 				} else {
-					files[strings.Replace(path, "tmp/", "", 1)] = path
+					key := strings.Replace(path, sourcePath+"/", "", 1)
+					files[key] = path
 
-					log.Println(file.Name(), path, info.Size())
+					log.Println(path, sourcePath)
+
+					log.Println(file.Name(), key, info.Size())
 				}
 			}
 
@@ -95,25 +101,85 @@ func CreateImage(tag string) error {
 
 	tarContextReader := bytes.NewReader(tarBuffer.Bytes())
 
-	log.Println("\x1b[0;32mfinished building tar-context\x1b[0m")
+	utils.Print("finished building tar-context", utils.NORMAL)
 
-	res, err := cli.ImageBuild(context.Background(), tarContextReader, types.ImageBuildOptions{
-		Dockerfile: "Dockerfile",
-		Tags:       []string{tag}})
+	res, err := cli.ImageBuild(
+		context.Background(),
+		tarContextReader,
+		types.ImageBuildOptions{
+			Dockerfile: "Dockerfile",
+			Tags:       []string{tag},
+		},
+	)
 
 	if err != nil {
-		log.Println(err, " :unable to build docker image")
-	} else {
-		defer res.Body.Close()
-
-		_, err = io.Copy(os.Stdout, res.Body)
-
-		if err != nil {
-			return errors.New(err.Error() + " :unable to read image build response")
-		}
+		return err
 	}
 
-	log.Println("\x1b[0;32mSuccessfully built image\x1b[0m")
+	defer res.Body.Close()
+
+	_, err = io.Copy(os.Stdout, res.Body)
+
+	if err != nil {
+		return errors.New(err.Error() + " :unable to read image build response")
+	}
+
+	log.Println("\x1b[0;32msuccessfully built image\x1b[0m")
+
+	return nil
+}
+
+// CreateAndStart runs a built image and collects the produced artifacts.
+func CreateAndStart(image string, targetAbsPath string) error {
+	// FIXME: Read cli version from ENV.
+	cli, err := client.NewClientWithOpts(client.WithVersion("1.37"))
+
+	if err != nil {
+		return err
+	}
+
+	utils.Print("artifacts will be built to "+targetAbsPath, utils.INFO)
+
+	res, err := cli.ContainerCreate(
+		context.Background(),
+		&container.Config{
+			Image: image,
+			// TODO: Override cmd via project yaml and/or environment variables.
+			// Cmd:   []string{"touch", "/opt/app/build/bin.dat"},
+			Tty: true,
+		},
+		&container.HostConfig{
+			Mounts: []mount.Mount{
+				{
+					Type:   mount.TypeBind,
+					Source: targetAbsPath,
+					Target: "/usr/src/app/build",
+				},
+			},
+		},
+		nil,
+		"",
+	)
+	ctx := context.Background()
+	err = cli.ContainerStart(
+		ctx,
+		res.ID,
+		types.ContainerStartOptions{},
+	)
+	statusCh, errCh := cli.ContainerWait(
+		ctx,
+		res.ID,
+		container.WaitConditionNotRunning,
+	)
+
+	// Block and wait for container to finish the internal build.
+	select {
+	case err := <-errCh:
+		return err
+	case <-statusCh:
+	}
+
+	utils.Print(fmt.Sprintf("%s finished successfully", res.ID), utils.NORMAL)
 
 	return nil
 }
