@@ -2,6 +2,7 @@ package main
 
 import (
 	"builder/actions"
+	"builder/integrations"
 	"builder/models"
 	"builder/repositories"
 	"builder/utils"
@@ -10,8 +11,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/uuid"
+	"github.com/otiai10/copy"
 	"gopkg.in/src-d/go-git.v4"
 )
 
@@ -21,7 +24,8 @@ func main() {
 	add := flag.String("add", "", "Adds a new project to the systems context, add <project-name> <source>")
 	remove := flag.String("delete", "", "removes project by name, remove <project-name>")
 	trigger := flag.String("trigger", "", "trigger <project-name> <tag> <bucket>")
-	status := flag.String("status", "", "status <project-filter-by-name>")
+	status := flag.Bool("status", false, "status <project-filter-by-name>")
+	rollback := flag.Bool("rollback", false, "rollback <project>:<tag>")
 
 	flag.Parse()
 
@@ -36,7 +40,7 @@ func main() {
 		fmt.Println(options)
 		utils.Print("Not implemented", utils.INFO)
 		return
-	} else if len(*status) > 0 {
+	} else if *status {
 		err := actions.List(session)
 
 		if err != nil {
@@ -47,7 +51,6 @@ func main() {
 		tag := options[0]
 		bucket := options[1]
 
-		// TODO: each project context should exist in an own folder.
 		project, err := actions.GetProject(projectName, session)
 		imageTag := project.Name + ":" + tag
 		buildID := uuid.New().String()
@@ -77,44 +80,77 @@ func main() {
 			return
 		}
 
-		if err != nil {
-			log.Println(err)
-			return
-		}
-
 		if err := os.RemoveAll(sourceAbsPath); err != nil {
 			log.Println(err)
 		}
 
-		if err != nil {
-			utils.Print("project not found; "+err.Error(), utils.WARNING)
-			return
-		}
-
-		git.PlainClone(sourcePath, false, &git.CloneOptions{
+		_, err = git.PlainClone(sourcePath, false, &git.CloneOptions{
 			URL:      project.Source,
 			Progress: os.Stdout,
 		})
 
 		if err != nil {
 			utils.Print(err.Error(), utils.ERROR)
+
+			return
 		}
 
 		if err := actions.CreateImage(tag, sourcePath); err != nil {
 			utils.Print("failed to build container: "+err.Error(), utils.ERROR)
 		}
 
-		session.UpdateBuild(buildID, models.COMPLETED)
-
 		if err := actions.CreateAndStart(tag, targetAbsPath); err != nil {
 			utils.Print(err.Error(), utils.ERROR)
 		}
+
+		session.UpdateBuild(buildID, models.COMPLETED)
 
 		if err := actions.Archive(projectName, tag); err != nil {
 			utils.Print(err.Error(), utils.WARNING)
 		}
 
 		actions.Upload(projectName, tag, bucket)
+		actions.UploadArchive(projectName, tag, bucket)
+	} else if *rollback {
+		aws := &integrations.AwsService{Region: "eu-west-2"} // FIXME: set region by env.
+		aws.Init()
+
+		projectConfig := strings.Split(options[0], ":")
+		name := &projectConfig[0]
+		tag := &projectConfig[1]
+		bucket := &options[1]
+
+		log.Println("Should rollback to", *name, *tag)
+
+		activePath := fmt.Sprintf("artifacts/%s/%s", *name, *tag)
+		target := fmt.Sprintf("artifacts/%s/archive/%s.tar.gz", *name, *tag)
+		remoteTarget := fmt.Sprintf("archive/%s.tar.gz", *tag)
+
+		aws.Download(remoteTarget, target, *bucket)
+
+		if err := os.RemoveAll(activePath); err != nil {
+			log.Println(err)
+		}
+
+		if err := actions.OpenArchive(*name, *tag, activePath); err != nil {
+			panic(err)
+		}
+
+		err := copy.Copy(activePath+"/"+*tag, activePath)
+
+		os.RemoveAll(activePath + "/" + *tag)
+
+		if err != nil {
+			panic(err)
+		}
+
+		err = actions.Upload(*name, *tag, *bucket)
+
+		if err != nil {
+			panic(err)
+		}
+
+		return
 	}
 
 	return

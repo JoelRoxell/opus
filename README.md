@@ -31,7 +31,7 @@ Status `opus -list <filter>`
 
 Deployment `opus -deploy project-name <tag>`
 
-Rollback `opus -rollback project-name`
+Rollback `opus -rollback project:tag bucket`
 
 Install server-processes to current kube-context `opus -install`
 
